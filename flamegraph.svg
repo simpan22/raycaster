@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="822" onload="init(evt)" viewBox="0 0 1200 822" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="822" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">Flame Graph</text><text id="details" fill="rgb(0,0,0)" x="10" y="805.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="805.00"> </text><svg id="frames" x="10" width="1180" total_samples="20873"><g><title>shooter3:gdrv0 (14 samples, 0.07%)</title><rect x="0.0000%" y="757" width="0.0671%" height="15" fill="rgb(227,0,7)" fg:x="0" fg:w="14"/><text x="0.2500%" y="767.50"></text></g><g><title>__clone3 (13 samples, 0.06%)</title><rect x="0.0048%" y="741" width="0.0623%" height="15" fill="rgb(217,0,24)" fg:x="1" fg:w="13"/><text x="0.2548%" y="751.50"></text></g><g><title>start_thread (8 samples, 0.04%)</title><rect x="0.0287%" y="725" width="0.0383%" height="15" fill="rgb(221,193,54)" fg:x="6" fg:w="8"/><text x="0.2787%" y="735.50"></text></g><g><title>[iris_dri.so] (8 samples, 0.04%)</title><rect x="0.0287%" y="709" width="0.0383%" height="15" fill="rgb(248,212,6)" fg:x="6" fg:w="8"/><text x="0.2787%" y="719.50"></text></g><g><title>[iris_dri.so] (8 samples, 0.04%)</title><rect x="0.0287%" y="693" width="0.0383%" height="15" fill="rgb(208,68,35)" fg:x="6" fg:w="8"/><text x="0.2787%" y="703.50"></text></g><g><title>[iris_dri.so] (8 samples, 0.04%)</title><rect x="0.0287%" y="677" width="0.0383%" height="15" fill="rgb(232,128,0)" fg:x="6" fg:w="8"/><text x="0.2787%" y="687.50"></text></g><g><title>[iris_dri.so] (8 samples, 0.04%)</title><rect x="0.0287%" y="661" width="0.0383%" height="15" fill="rgb(207,160,47)" fg:x="6" fg:w="8"/><text x="0.2787%" y="671.50"></text></g><g><title>[iris_dri.so] (8 samples, 0.04%)</title><rect x="0.0287%" y="645" width="0.0383%" height="15" fill="rgb(228,23,34)" fg:x="6" fg:w="8"/><text x="0.2787%" y="655.50"></text></g><g><title>[iris_dri.so] (6 samples, 0.03%)</title><rect x="0.0383%" y="629" width="0.0287%" height="15" fill="rgb(218,30,26)" fg:x="8" fg:w="6"/><text x="0.2883%" y="639.50"></text></g><g><title>shooter3d:sh0 (6 samples, 0.03%)</title><rect x="0.0671%" y="757" width="0.0287%" height="15" fill="rgb(220,122,19)" fg:x="14" fg:w="6"/><text x="0.3171%" y="767.50"></text></g><g><title>__clone3 (6 samples, 0.03%)</title><rect x="0.0671%" y="741" width="0.0287%" height="15" fill="rgb(250,228,42)" fg:x="14" fg:w="6"/><text x="0.3171%" y="751.50"></text></g><g><title>start_thread (5 samples, 0.02%)</title><rect x="0.0719%" y="725" width="0.0240%" height="15" fill="rgb(240,193,28)" fg:x="15" fg:w="5"/><text x="0.3219%" y="735.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.0719%" y="709" width="0.0240%" height="15" fill="rgb(216,20,37)" fg:x="15" fg:w="5"/><text x="0.3219%" y="719.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.0719%" y="693" width="0.0240%" height="15" fill="rgb(206,188,39)" fg:x="15" fg:w="5"/><text x="0.3219%" y="703.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.0719%" y="677" width="0.0240%" height="15" fill="rgb(217,207,13)" fg:x="15" fg:w="5"/><text x="0.3219%" y="687.50"></text></g><g><title>__GI___pthread_cond_wait (5 samples, 0.02%)</title><rect x="0.0719%" y="661" width="0.0240%" height="15" fill="rgb(231,73,38)" fg:x="15" fg:w="5"/><text x="0.3219%" y="671.50"></text></g><g><title>__futex_abstimed_wait_common (5 samples, 0.02%)</title><rect x="0.0719%" y="645" width="0.0240%" height="15" fill="rgb(225,20,46)" fg:x="15" fg:w="5"/><text x="0.3219%" y="655.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.1006%" y="709" width="0.0240%" height="15" fill="rgb(210,31,41)" fg:x="21" fg:w="5"/><text x="0.3506%" y="719.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.1006%" y="693" width="0.0240%" height="15" fill="rgb(221,200,47)" fg:x="21" fg:w="5"/><text x="0.3506%" y="703.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.1006%" y="677" width="0.0240%" height="15" fill="rgb(226,26,5)" fg:x="21" fg:w="5"/><text x="0.3506%" y="687.50"></text></g><g><title>__GI___pthread_cond_wait (5 samples, 0.02%)</title><rect x="0.1006%" y="661" width="0.0240%" height="15" fill="rgb(249,33,26)" fg:x="21" fg:w="5"/><text x="0.3506%" y="671.50"></text></g><g><title>__futex_abstimed_wait_common (5 samples, 0.02%)</title><rect x="0.1006%" y="645" width="0.0240%" height="15" fill="rgb(235,183,28)" fg:x="21" fg:w="5"/><text x="0.3506%" y="655.50"></text></g><g><title>shooter3d:sh1 (7 samples, 0.03%)</title><rect x="0.0958%" y="757" width="0.0335%" height="15" fill="rgb(221,5,38)" fg:x="20" fg:w="7"/><text x="0.3458%" y="767.50"></text></g><g><title>__clone3 (7 samples, 0.03%)</title><rect x="0.0958%" y="741" width="0.0335%" height="15" fill="rgb(247,18,42)" fg:x="20" fg:w="7"/><text x="0.3458%" y="751.50"></text></g><g><title>start_thread (6 samples, 0.03%)</title><rect x="0.1006%" y="725" width="0.0287%" height="15" fill="rgb(241,131,45)" fg:x="21" fg:w="6"/><text x="0.3506%" y="735.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.1437%" y="709" width="0.0240%" height="15" fill="rgb(249,31,29)" fg:x="30" fg:w="5"/><text x="0.3937%" y="719.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.1437%" y="693" width="0.0240%" height="15" fill="rgb(225,111,53)" fg:x="30" fg:w="5"/><text x="0.3937%" y="703.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.1437%" y="677" width="0.0240%" height="15" fill="rgb(238,160,17)" fg:x="30" fg:w="5"/><text x="0.3937%" y="687.50"></text></g><g><title>__GI___pthread_cond_wait (5 samples, 0.02%)</title><rect x="0.1437%" y="661" width="0.0240%" height="15" fill="rgb(214,148,48)" fg:x="30" fg:w="5"/><text x="0.3937%" y="671.50"></text></g><g><title>__futex_abstimed_wait_common (5 samples, 0.02%)</title><rect x="0.1437%" y="645" width="0.0240%" height="15" fill="rgb(232,36,49)" fg:x="30" fg:w="5"/><text x="0.3937%" y="655.50"></text></g><g><title>shooter3d:sh4 (7 samples, 0.03%)</title><rect x="0.1389%" y="757" width="0.0335%" height="15" fill="rgb(209,103,24)" fg:x="29" fg:w="7"/><text x="0.3889%" y="767.50"></text></g><g><title>__clone3 (7 samples, 0.03%)</title><rect x="0.1389%" y="741" width="0.0335%" height="15" fill="rgb(229,88,8)" fg:x="29" fg:w="7"/><text x="0.3889%" y="751.50"></text></g><g><title>start_thread (6 samples, 0.03%)</title><rect x="0.1437%" y="725" width="0.0287%" height="15" fill="rgb(213,181,19)" fg:x="30" fg:w="6"/><text x="0.3937%" y="735.50"></text></g><g><title>__clone3 (4 samples, 0.02%)</title><rect x="0.1725%" y="741" width="0.0192%" height="15" fill="rgb(254,191,54)" fg:x="36" fg:w="4"/><text x="0.4225%" y="751.50"></text></g><g><title>start_thread (3 samples, 0.01%)</title><rect x="0.1773%" y="725" width="0.0144%" height="15" fill="rgb(241,83,37)" fg:x="37" fg:w="3"/><text x="0.4273%" y="735.50"></text></g><g><title>[iris_dri.so] (3 samples, 0.01%)</title><rect x="0.1773%" y="709" width="0.0144%" height="15" fill="rgb(233,36,39)" fg:x="37" fg:w="3"/><text x="0.4273%" y="719.50"></text></g><g><title>[iris_dri.so] (3 samples, 0.01%)</title><rect x="0.1773%" y="693" width="0.0144%" height="15" fill="rgb(226,3,54)" fg:x="37" fg:w="3"/><text x="0.4273%" y="703.50"></text></g><g><title>[iris_dri.so] (3 samples, 0.01%)</title><rect x="0.1773%" y="677" width="0.0144%" height="15" fill="rgb(245,192,40)" fg:x="37" fg:w="3"/><text x="0.4273%" y="687.50"></text></g><g><title>__GI___pthread_cond_wait (3 samples, 0.01%)</title><rect x="0.1773%" y="661" width="0.0144%" height="15" fill="rgb(238,167,29)" fg:x="37" fg:w="3"/><text x="0.4273%" y="671.50"></text></g><g><title>__futex_abstimed_wait_common (3 samples, 0.01%)</title><rect x="0.1773%" y="645" width="0.0144%" height="15" fill="rgb(232,182,51)" fg:x="37" fg:w="3"/><text x="0.4273%" y="655.50"></text></g><g><title>shooter3d:sh5 (5 samples, 0.02%)</title><rect x="0.1725%" y="757" width="0.0240%" height="15" fill="rgb(231,60,39)" fg:x="36" fg:w="5"/><text x="0.4225%" y="767.50"></text></g><g><title>shooter3d:sh6 (6 samples, 0.03%)</title><rect x="0.1964%" y="757" width="0.0287%" height="15" fill="rgb(208,69,12)" fg:x="41" fg:w="6"/><text x="0.4464%" y="767.50"></text></g><g><title>__clone3 (6 samples, 0.03%)</title><rect x="0.1964%" y="741" width="0.0287%" height="15" fill="rgb(235,93,37)" fg:x="41" fg:w="6"/><text x="0.4464%" y="751.50"></text></g><g><title>start_thread (5 samples, 0.02%)</title><rect x="0.2012%" y="725" width="0.0240%" height="15" fill="rgb(213,116,39)" fg:x="42" fg:w="5"/><text x="0.4512%" y="735.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.2012%" y="709" width="0.0240%" height="15" fill="rgb(222,207,29)" fg:x="42" fg:w="5"/><text x="0.4512%" y="719.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.2012%" y="693" width="0.0240%" height="15" fill="rgb(206,96,30)" fg:x="42" fg:w="5"/><text x="0.4512%" y="703.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.2012%" y="677" width="0.0240%" height="15" fill="rgb(218,138,4)" fg:x="42" fg:w="5"/><text x="0.4512%" y="687.50"></text></g><g><title>__GI___pthread_cond_wait (5 samples, 0.02%)</title><rect x="0.2012%" y="661" width="0.0240%" height="15" fill="rgb(250,191,14)" fg:x="42" fg:w="5"/><text x="0.4512%" y="671.50"></text></g><g><title>__futex_abstimed_wait_common (5 samples, 0.02%)</title><rect x="0.2012%" y="645" width="0.0240%" height="15" fill="rgb(239,60,40)" fg:x="42" fg:w="5"/><text x="0.4512%" y="655.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.2348%" y="709" width="0.0240%" height="15" fill="rgb(206,27,48)" fg:x="49" fg:w="5"/><text x="0.4848%" y="719.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.2348%" y="693" width="0.0240%" height="15" fill="rgb(225,35,8)" fg:x="49" fg:w="5"/><text x="0.4848%" y="703.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.2348%" y="677" width="0.0240%" height="15" fill="rgb(250,213,24)" fg:x="49" fg:w="5"/><text x="0.4848%" y="687.50"></text></g><g><title>__GI___pthread_cond_wait (5 samples, 0.02%)</title><rect x="0.2348%" y="661" width="0.0240%" height="15" fill="rgb(247,123,22)" fg:x="49" fg:w="5"/><text x="0.4848%" y="671.50"></text></g><g><title>__futex_abstimed_wait_common (5 samples, 0.02%)</title><rect x="0.2348%" y="645" width="0.0240%" height="15" fill="rgb(231,138,38)" fg:x="49" fg:w="5"/><text x="0.4848%" y="655.50"></text></g><g><title>shooter3d:sh8 (7 samples, 0.03%)</title><rect x="0.2300%" y="757" width="0.0335%" height="15" fill="rgb(231,145,46)" fg:x="48" fg:w="7"/><text x="0.4800%" y="767.50"></text></g><g><title>__clone3 (7 samples, 0.03%)</title><rect x="0.2300%" y="741" width="0.0335%" height="15" fill="rgb(251,118,11)" fg:x="48" fg:w="7"/><text x="0.4800%" y="751.50"></text></g><g><title>start_thread (6 samples, 0.03%)</title><rect x="0.2348%" y="725" width="0.0287%" height="15" fill="rgb(217,147,25)" fg:x="49" fg:w="6"/><text x="0.4848%" y="735.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (10 samples, 0.05%)</title><rect x="0.2731%" y="741" width="0.0479%" height="15" fill="rgb(247,81,37)" fg:x="57" fg:w="10"/><text x="0.5231%" y="751.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (25 samples, 0.12%)</title><rect x="0.3306%" y="725" width="0.1198%" height="15" fill="rgb(209,12,38)" fg:x="69" fg:w="25"/><text x="0.5806%" y="735.50"></text></g><g><title>sdl2::render::Canvas&lt;T&gt;::draw_point (4 samples, 0.02%)</title><rect x="0.4791%" y="693" width="0.0192%" height="15" fill="rgb(227,1,9)" fg:x="100" fg:w="4"/><text x="0.7291%" y="703.50"></text></g><g><title>[unknown] (38 samples, 0.18%)</title><rect x="0.3210%" y="741" width="0.1821%" height="15" fill="rgb(248,47,43)" fg:x="67" fg:w="38"/><text x="0.5710%" y="751.50"></text></g><g><title>shooter3d::main (5 samples, 0.02%)</title><rect x="0.4791%" y="725" width="0.0240%" height="15" fill="rgb(221,10,30)" fg:x="100" fg:w="5"/><text x="0.7291%" y="735.50"></text></g><g><title>shooter3d::render (5 samples, 0.02%)</title><rect x="0.4791%" y="709" width="0.0240%" height="15" fill="rgb(210,229,1)" fg:x="100" fg:w="5"/><text x="0.7291%" y="719.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (6 samples, 0.03%)</title><rect x="0.5653%" y="373" width="0.0287%" height="15" fill="rgb(222,148,37)" fg:x="118" fg:w="6"/><text x="0.8153%" y="383.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (4 samples, 0.02%)</title><rect x="0.5749%" y="357" width="0.0192%" height="15" fill="rgb(234,67,33)" fg:x="120" fg:w="4"/><text x="0.8249%" y="367.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (4 samples, 0.02%)</title><rect x="0.5749%" y="341" width="0.0192%" height="15" fill="rgb(247,98,35)" fg:x="120" fg:w="4"/><text x="0.8249%" y="351.50"></text></g><g><title>[libGLX.so.0.0.0] (4 samples, 0.02%)</title><rect x="0.5749%" y="325" width="0.0192%" height="15" fill="rgb(247,138,52)" fg:x="120" fg:w="4"/><text x="0.8249%" y="335.50"></text></g><g><title>[libGLX.so.0.0.0] (4 samples, 0.02%)</title><rect x="0.5749%" y="309" width="0.0192%" height="15" fill="rgb(213,79,30)" fg:x="120" fg:w="4"/><text x="0.8249%" y="319.50"></text></g><g><title>[libGLX_mesa.so.0.0.0] (4 samples, 0.02%)</title><rect x="0.5749%" y="293" width="0.0192%" height="15" fill="rgb(246,177,23)" fg:x="120" fg:w="4"/><text x="0.8249%" y="303.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="277" width="0.0192%" height="15" fill="rgb(230,62,27)" fg:x="120" fg:w="4"/><text x="0.8249%" y="287.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="261" width="0.0192%" height="15" fill="rgb(216,154,8)" fg:x="120" fg:w="4"/><text x="0.8249%" y="271.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="245" width="0.0192%" height="15" fill="rgb(244,35,45)" fg:x="120" fg:w="4"/><text x="0.8249%" y="255.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="229" width="0.0192%" height="15" fill="rgb(251,115,12)" fg:x="120" fg:w="4"/><text x="0.8249%" y="239.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="213" width="0.0192%" height="15" fill="rgb(240,54,50)" fg:x="120" fg:w="4"/><text x="0.8249%" y="223.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="197" width="0.0192%" height="15" fill="rgb(233,84,52)" fg:x="120" fg:w="4"/><text x="0.8249%" y="207.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="181" width="0.0192%" height="15" fill="rgb(207,117,47)" fg:x="120" fg:w="4"/><text x="0.8249%" y="191.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="165" width="0.0192%" height="15" fill="rgb(249,43,39)" fg:x="120" fg:w="4"/><text x="0.8249%" y="175.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="149" width="0.0192%" height="15" fill="rgb(209,38,44)" fg:x="120" fg:w="4"/><text x="0.8249%" y="159.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="133" width="0.0192%" height="15" fill="rgb(236,212,23)" fg:x="120" fg:w="4"/><text x="0.8249%" y="143.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="117" width="0.0192%" height="15" fill="rgb(242,79,21)" fg:x="120" fg:w="4"/><text x="0.8249%" y="127.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.5749%" y="101" width="0.0192%" height="15" fill="rgb(211,96,35)" fg:x="120" fg:w="4"/><text x="0.8249%" y="111.50"></text></g><g><title>__free (4 samples, 0.02%)</title><rect x="0.5749%" y="85" width="0.0192%" height="15" fill="rgb(253,215,40)" fg:x="120" fg:w="4"/><text x="0.8249%" y="95.50"></text></g><g><title>_int_free (4 samples, 0.02%)</title><rect x="0.5749%" y="69" width="0.0192%" height="15" fill="rgb(211,81,21)" fg:x="120" fg:w="4"/><text x="0.8249%" y="79.50"></text></g><g><title>malloc_consolidate (4 samples, 0.02%)</title><rect x="0.5749%" y="53" width="0.0192%" height="15" fill="rgb(208,190,38)" fg:x="120" fg:w="4"/><text x="0.8249%" y="63.50"></text></g><g><title>&lt;sdl2::render::RendererContext&lt;T&gt; as core::ops::drop::Drop&gt;::drop (12 samples, 0.06%)</title><rect x="0.5510%" y="405" width="0.0575%" height="15" fill="rgb(235,213,38)" fg:x="115" fg:w="12"/><text x="0.8010%" y="415.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (12 samples, 0.06%)</title><rect x="0.5510%" y="389" width="0.0575%" height="15" fill="rgb(237,122,38)" fg:x="115" fg:w="12"/><text x="0.8010%" y="399.50"></text></g><g><title>__free (3 samples, 0.01%)</title><rect x="0.5941%" y="373" width="0.0144%" height="15" fill="rgb(244,218,35)" fg:x="124" fg:w="3"/><text x="0.8441%" y="383.50"></text></g><g><title>[libGLX_mesa.so.0.0.0] (6 samples, 0.03%)</title><rect x="0.6084%" y="213" width="0.0287%" height="15" fill="rgb(240,68,47)" fg:x="127" fg:w="6"/><text x="0.8584%" y="223.50"></text></g><g><title>[libGLX_mesa.so.0.0.0] (6 samples, 0.03%)</title><rect x="0.6084%" y="197" width="0.0287%" height="15" fill="rgb(210,16,53)" fg:x="127" fg:w="6"/><text x="0.8584%" y="207.50"></text></g><g><title>[libGLX_mesa.so.0.0.0] (6 samples, 0.03%)</title><rect x="0.6084%" y="181" width="0.0287%" height="15" fill="rgb(235,124,12)" fg:x="127" fg:w="6"/><text x="0.8584%" y="191.50"></text></g><g><title>[iris_dri.so] (6 samples, 0.03%)</title><rect x="0.6084%" y="165" width="0.0287%" height="15" fill="rgb(224,169,11)" fg:x="127" fg:w="6"/><text x="0.8584%" y="175.50"></text></g><g><title>[iris_dri.so] (6 samples, 0.03%)</title><rect x="0.6084%" y="149" width="0.0287%" height="15" fill="rgb(250,166,2)" fg:x="127" fg:w="6"/><text x="0.8584%" y="159.50"></text></g><g><title>[iris_dri.so] (6 samples, 0.03%)</title><rect x="0.6084%" y="133" width="0.0287%" height="15" fill="rgb(242,216,29)" fg:x="127" fg:w="6"/><text x="0.8584%" y="143.50"></text></g><g><title>[iris_dri.so] (6 samples, 0.03%)</title><rect x="0.6084%" y="117" width="0.0287%" height="15" fill="rgb(230,116,27)" fg:x="127" fg:w="6"/><text x="0.8584%" y="127.50"></text></g><g><title>[iris_dri.so] (6 samples, 0.03%)</title><rect x="0.6084%" y="101" width="0.0287%" height="15" fill="rgb(228,99,48)" fg:x="127" fg:w="6"/><text x="0.8584%" y="111.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.6132%" y="85" width="0.0240%" height="15" fill="rgb(253,11,6)" fg:x="128" fg:w="5"/><text x="0.8632%" y="95.50"></text></g><g><title>__pthread_clockjoin_ex (5 samples, 0.02%)</title><rect x="0.6132%" y="69" width="0.0240%" height="15" fill="rgb(247,143,39)" fg:x="128" fg:w="5"/><text x="0.8632%" y="79.50"></text></g><g><title>__futex_abstimed_wait_common (5 samples, 0.02%)</title><rect x="0.6132%" y="53" width="0.0240%" height="15" fill="rgb(236,97,10)" fg:x="128" fg:w="5"/><text x="0.8632%" y="63.50"></text></g><g><title>core::ptr::drop_in_place&lt;sdl2::render::Canvas&lt;sdl2::video::Window&gt;&gt; (19 samples, 0.09%)</title><rect x="0.5510%" y="469" width="0.0910%" height="15" fill="rgb(233,208,19)" fg:x="115" fg:w="19"/><text x="0.8010%" y="479.50"></text></g><g><title>core::ptr::drop_in_place&lt;alloc::rc::Rc&lt;sdl2::render::RendererContext&lt;sdl2::video::WindowContext&gt;&gt;&gt; (19 samples, 0.09%)</title><rect x="0.5510%" y="453" width="0.0910%" height="15" fill="rgb(216,164,2)" fg:x="115" fg:w="19"/><text x="0.8010%" y="463.50"></text></g><g><title>&lt;alloc::rc::Rc&lt;T&gt; as core::ops::drop::Drop&gt;::drop (19 samples, 0.09%)</title><rect x="0.5510%" y="437" width="0.0910%" height="15" fill="rgb(220,129,5)" fg:x="115" fg:w="19"/><text x="0.8010%" y="447.50"></text></g><g><title>core::ptr::drop_in_place&lt;sdl2::render::RendererContext&lt;sdl2::video::WindowContext&gt;&gt; (19 samples, 0.09%)</title><rect x="0.5510%" y="421" width="0.0910%" height="15" fill="rgb(242,17,10)" fg:x="115" fg:w="19"/><text x="0.8010%" y="431.50"></text></g><g><title>core::ptr::drop_in_place&lt;alloc::rc::Rc&lt;sdl2::video::WindowContext&gt;&gt; (7 samples, 0.03%)</title><rect x="0.6084%" y="405" width="0.0335%" height="15" fill="rgb(242,107,0)" fg:x="127" fg:w="7"/><text x="0.8584%" y="415.50"></text></g><g><title>&lt;alloc::rc::Rc&lt;T&gt; as core::ops::drop::Drop&gt;::drop (7 samples, 0.03%)</title><rect x="0.6084%" y="389" width="0.0335%" height="15" fill="rgb(251,28,31)" fg:x="127" fg:w="7"/><text x="0.8584%" y="399.50"></text></g><g><title>core::ptr::drop_in_place&lt;sdl2::video::WindowContext&gt; (7 samples, 0.03%)</title><rect x="0.6084%" y="373" width="0.0335%" height="15" fill="rgb(233,223,10)" fg:x="127" fg:w="7"/><text x="0.8584%" y="383.50"></text></g><g><title>core::ptr::drop_in_place&lt;sdl2::sdl::VideoSubsystem&gt; (7 samples, 0.03%)</title><rect x="0.6084%" y="357" width="0.0335%" height="15" fill="rgb(215,21,27)" fg:x="127" fg:w="7"/><text x="0.8584%" y="367.50"></text></g><g><title>core::ptr::drop_in_place&lt;alloc::rc::Rc&lt;sdl2::sdl::SubsystemDrop&gt;&gt; (7 samples, 0.03%)</title><rect x="0.6084%" y="341" width="0.0335%" height="15" fill="rgb(232,23,21)" fg:x="127" fg:w="7"/><text x="0.8584%" y="351.50"></text></g><g><title>&lt;alloc::rc::Rc&lt;T&gt; as core::ops::drop::Drop&gt;::drop (7 samples, 0.03%)</title><rect x="0.6084%" y="325" width="0.0335%" height="15" fill="rgb(244,5,23)" fg:x="127" fg:w="7"/><text x="0.8584%" y="335.50"></text></g><g><title>core::ptr::drop_in_place&lt;sdl2::sdl::SubsystemDrop&gt; (7 samples, 0.03%)</title><rect x="0.6084%" y="309" width="0.0335%" height="15" fill="rgb(226,81,46)" fg:x="127" fg:w="7"/><text x="0.8584%" y="319.50"></text></g><g><title>&lt;sdl2::sdl::SubsystemDrop as core::ops::drop::Drop&gt;::drop (7 samples, 0.03%)</title><rect x="0.6084%" y="293" width="0.0335%" height="15" fill="rgb(247,70,30)" fg:x="127" fg:w="7"/><text x="0.8584%" y="303.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (7 samples, 0.03%)</title><rect x="0.6084%" y="277" width="0.0335%" height="15" fill="rgb(212,68,19)" fg:x="127" fg:w="7"/><text x="0.8584%" y="287.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (7 samples, 0.03%)</title><rect x="0.6084%" y="261" width="0.0335%" height="15" fill="rgb(240,187,13)" fg:x="127" fg:w="7"/><text x="0.8584%" y="271.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (7 samples, 0.03%)</title><rect x="0.6084%" y="245" width="0.0335%" height="15" fill="rgb(223,113,26)" fg:x="127" fg:w="7"/><text x="0.8584%" y="255.50"></text></g><g><title>XCloseDisplay (7 samples, 0.03%)</title><rect x="0.6084%" y="229" width="0.0335%" height="15" fill="rgb(206,192,2)" fg:x="127" fg:w="7"/><text x="0.8584%" y="239.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6420%" y="293" width="0.0192%" height="15" fill="rgb(241,108,4)" fg:x="134" fg:w="4"/><text x="0.8920%" y="303.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6420%" y="277" width="0.0192%" height="15" fill="rgb(247,173,49)" fg:x="134" fg:w="4"/><text x="0.8920%" y="287.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6420%" y="261" width="0.0192%" height="15" fill="rgb(224,114,35)" fg:x="134" fg:w="4"/><text x="0.8920%" y="271.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6420%" y="245" width="0.0192%" height="15" fill="rgb(245,159,27)" fg:x="134" fg:w="4"/><text x="0.8920%" y="255.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6420%" y="229" width="0.0192%" height="15" fill="rgb(245,172,44)" fg:x="134" fg:w="4"/><text x="0.8920%" y="239.50"></text></g><g><title>[iris_dri.so] (3 samples, 0.01%)</title><rect x="0.6468%" y="213" width="0.0144%" height="15" fill="rgb(236,23,11)" fg:x="135" fg:w="3"/><text x="0.8968%" y="223.50"></text></g><g><title>[iris_dri.so] (3 samples, 0.01%)</title><rect x="0.6468%" y="197" width="0.0144%" height="15" fill="rgb(205,117,38)" fg:x="135" fg:w="3"/><text x="0.8968%" y="207.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.6420%" y="405" width="0.0240%" height="15" fill="rgb(237,72,25)" fg:x="134" fg:w="5"/><text x="0.8920%" y="415.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.6420%" y="389" width="0.0240%" height="15" fill="rgb(244,70,9)" fg:x="134" fg:w="5"/><text x="0.8920%" y="399.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.6420%" y="373" width="0.0240%" height="15" fill="rgb(217,125,39)" fg:x="134" fg:w="5"/><text x="0.8920%" y="383.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.6420%" y="357" width="0.0240%" height="15" fill="rgb(235,36,10)" fg:x="134" fg:w="5"/><text x="0.8920%" y="367.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.6420%" y="341" width="0.0240%" height="15" fill="rgb(251,123,47)" fg:x="134" fg:w="5"/><text x="0.8920%" y="351.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.6420%" y="325" width="0.0240%" height="15" fill="rgb(221,13,13)" fg:x="134" fg:w="5"/><text x="0.8920%" y="335.50"></text></g><g><title>[iris_dri.so] (5 samples, 0.02%)</title><rect x="0.6420%" y="309" width="0.0240%" height="15" fill="rgb(238,131,9)" fg:x="134" fg:w="5"/><text x="0.8920%" y="319.50"></text></g><g><title>sdl2::render::CanvasBuilder::build (9 samples, 0.04%)</title><rect x="0.6420%" y="453" width="0.0431%" height="15" fill="rgb(211,50,8)" fg:x="134" fg:w="9"/><text x="0.8920%" y="463.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (9 samples, 0.04%)</title><rect x="0.6420%" y="437" width="0.0431%" height="15" fill="rgb(245,182,24)" fg:x="134" fg:w="9"/><text x="0.8920%" y="447.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (9 samples, 0.04%)</title><rect x="0.6420%" y="421" width="0.0431%" height="15" fill="rgb(242,14,37)" fg:x="134" fg:w="9"/><text x="0.8920%" y="431.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (4 samples, 0.02%)</title><rect x="0.6659%" y="405" width="0.0192%" height="15" fill="rgb(246,228,12)" fg:x="139" fg:w="4"/><text x="0.9159%" y="415.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6659%" y="389" width="0.0192%" height="15" fill="rgb(213,55,15)" fg:x="139" fg:w="4"/><text x="0.9159%" y="399.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6659%" y="373" width="0.0192%" height="15" fill="rgb(209,9,3)" fg:x="139" fg:w="4"/><text x="0.9159%" y="383.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6659%" y="357" width="0.0192%" height="15" fill="rgb(230,59,30)" fg:x="139" fg:w="4"/><text x="0.9159%" y="367.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6659%" y="341" width="0.0192%" height="15" fill="rgb(209,121,21)" fg:x="139" fg:w="4"/><text x="0.9159%" y="351.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="0.6659%" y="325" width="0.0192%" height="15" fill="rgb(220,109,13)" fg:x="139" fg:w="4"/><text x="0.9159%" y="335.50"></text></g><g><title>[iris_dri.so] (3 samples, 0.01%)</title><rect x="0.6707%" y="309" width="0.0144%" height="15" fill="rgb(232,18,1)" fg:x="140" fg:w="3"/><text x="0.9207%" y="319.50"></text></g><g><title>_XimOpenIM (7 samples, 0.03%)</title><rect x="0.6899%" y="357" width="0.0335%" height="15" fill="rgb(215,41,42)" fg:x="144" fg:w="7"/><text x="0.9399%" y="367.50"></text></g><g><title>_XimLocalOpenIM (7 samples, 0.03%)</title><rect x="0.6899%" y="341" width="0.0335%" height="15" fill="rgb(224,123,36)" fg:x="144" fg:w="7"/><text x="0.9399%" y="351.50"></text></g><g><title>[libX11.so.6.4.0] (7 samples, 0.03%)</title><rect x="0.6899%" y="325" width="0.0335%" height="15" fill="rgb(240,125,3)" fg:x="144" fg:w="7"/><text x="0.9399%" y="335.50"></text></g><g><title>sdl2::sdl::Sdl::video (9 samples, 0.04%)</title><rect x="0.6851%" y="453" width="0.0431%" height="15" fill="rgb(205,98,50)" fg:x="143" fg:w="9"/><text x="0.9351%" y="463.50"></text></g><g><title>sdl2::sdl::VideoSubsystem::new (9 samples, 0.04%)</title><rect x="0.6851%" y="437" width="0.0431%" height="15" fill="rgb(205,185,37)" fg:x="143" fg:w="9"/><text x="0.9351%" y="447.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (9 samples, 0.04%)</title><rect x="0.6851%" y="421" width="0.0431%" height="15" fill="rgb(238,207,15)" fg:x="143" fg:w="9"/><text x="0.9351%" y="431.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (9 samples, 0.04%)</title><rect x="0.6851%" y="405" width="0.0431%" height="15" fill="rgb(213,199,42)" fg:x="143" fg:w="9"/><text x="0.9351%" y="415.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (9 samples, 0.04%)</title><rect x="0.6851%" y="389" width="0.0431%" height="15" fill="rgb(235,201,11)" fg:x="143" fg:w="9"/><text x="0.9351%" y="399.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (9 samples, 0.04%)</title><rect x="0.6851%" y="373" width="0.0431%" height="15" fill="rgb(207,46,11)" fg:x="143" fg:w="9"/><text x="0.9351%" y="383.50"></text></g><g><title>[iris_dri.so] (3 samples, 0.01%)</title><rect x="0.7426%" y="325" width="0.0144%" height="15" fill="rgb(241,35,35)" fg:x="155" fg:w="3"/><text x="0.9926%" y="335.50"></text></g><g><title>[iris_dri.so] (3 samples, 0.01%)</title><rect x="0.7426%" y="309" width="0.0144%" height="15" fill="rgb(243,32,47)" fg:x="155" fg:w="3"/><text x="0.9926%" y="319.50"></text></g><g><title>[iris_dri.so] (3 samples, 0.01%)</title><rect x="0.7426%" y="293" width="0.0144%" height="15" fill="rgb(247,202,23)" fg:x="155" fg:w="3"/><text x="0.9926%" y="303.50"></text></g><g><title>[iris_dri.so] (10 samples, 0.05%)</title><rect x="0.7953%" y="309" width="0.0479%" height="15" fill="rgb(219,102,11)" fg:x="166" fg:w="10"/><text x="1.0453%" y="319.50"></text></g><g><title>[iris_dri.so] (8 samples, 0.04%)</title><rect x="0.8049%" y="293" width="0.0383%" height="15" fill="rgb(243,110,44)" fg:x="168" fg:w="8"/><text x="1.0549%" y="303.50"></text></g><g><title>elf_machine_rela (9 samples, 0.04%)</title><rect x="0.8480%" y="85" width="0.0431%" height="15" fill="rgb(222,74,54)" fg:x="177" fg:w="9"/><text x="1.0980%" y="95.50"></text></g><g><title>resolve_map (9 samples, 0.04%)</title><rect x="0.8480%" y="69" width="0.0431%" height="15" fill="rgb(216,99,12)" fg:x="177" fg:w="9"/><text x="1.0980%" y="79.50"></text></g><g><title>_dl_lookup_symbol_x (7 samples, 0.03%)</title><rect x="0.8576%" y="53" width="0.0335%" height="15" fill="rgb(226,22,26)" fg:x="179" fg:w="7"/><text x="1.1076%" y="63.50"></text></g><g><title>do_lookup_x (6 samples, 0.03%)</title><rect x="0.8624%" y="37" width="0.0287%" height="15" fill="rgb(217,163,10)" fg:x="180" fg:w="6"/><text x="1.1124%" y="47.50"></text></g><g><title>[libGLX_mesa.so.0.0.0] (29 samples, 0.14%)</title><rect x="0.7570%" y="325" width="0.1389%" height="15" fill="rgb(213,25,53)" fg:x="158" fg:w="29"/><text x="1.0070%" y="335.50"></text></g><g><title>[libGLX_mesa.so.0.0.0] (11 samples, 0.05%)</title><rect x="0.8432%" y="309" width="0.0527%" height="15" fill="rgb(252,105,26)" fg:x="176" fg:w="11"/><text x="1.0932%" y="319.50"></text></g><g><title>glLabelObjectEXT (11 samples, 0.05%)</title><rect x="0.8432%" y="293" width="0.0527%" height="15" fill="rgb(220,39,43)" fg:x="176" fg:w="11"/><text x="1.0932%" y="303.50"></text></g><g><title>___dlopen (11 samples, 0.05%)</title><rect x="0.8432%" y="277" width="0.0527%" height="15" fill="rgb(229,68,48)" fg:x="176" fg:w="11"/><text x="1.0932%" y="287.50"></text></g><g><title>_dlerror_run (11 samples, 0.05%)</title><rect x="0.8432%" y="261" width="0.0527%" height="15" fill="rgb(252,8,32)" fg:x="176" fg:w="11"/><text x="1.0932%" y="271.50"></text></g><g><title>__GI__dl_catch_error (11 samples, 0.05%)</title><rect x="0.8432%" y="245" width="0.0527%" height="15" fill="rgb(223,20,43)" fg:x="176" fg:w="11"/><text x="1.0932%" y="255.50"></text></g><g><title>__GI__dl_catch_exception (11 samples, 0.05%)</title><rect x="0.8432%" y="229" width="0.0527%" height="15" fill="rgb(229,81,49)" fg:x="176" fg:w="11"/><text x="1.0932%" y="239.50"></text></g><g><title>dlopen_doit (11 samples, 0.05%)</title><rect x="0.8432%" y="213" width="0.0527%" height="15" fill="rgb(236,28,36)" fg:x="176" fg:w="11"/><text x="1.0932%" y="223.50"></text></g><g><title>_dl_open (11 samples, 0.05%)</title><rect x="0.8432%" y="197" width="0.0527%" height="15" fill="rgb(249,185,26)" fg:x="176" fg:w="11"/><text x="1.0932%" y="207.50"></text></g><g><title>__GI__dl_catch_exception (11 samples, 0.05%)</title><rect x="0.8432%" y="181" width="0.0527%" height="15" fill="rgb(249,174,33)" fg:x="176" fg:w="11"/><text x="1.0932%" y="191.50"></text></g><g><title>dl_open_worker (11 samples, 0.05%)</title><rect x="0.8432%" y="165" width="0.0527%" height="15" fill="rgb(233,201,37)" fg:x="176" fg:w="11"/><text x="1.0932%" y="175.50"></text></g><g><title>__GI__dl_catch_exception (11 samples, 0.05%)</title><rect x="0.8432%" y="149" width="0.0527%" height="15" fill="rgb(221,78,26)" fg:x="176" fg:w="11"/><text x="1.0932%" y="159.50"></text></g><g><title>dl_open_worker_begin (10 samples, 0.05%)</title><rect x="0.8480%" y="133" width="0.0479%" height="15" fill="rgb(250,127,30)" fg:x="177" fg:w="10"/><text x="1.0980%" y="143.50"></text></g><g><title>_dl_relocate_object (10 samples, 0.05%)</title><rect x="0.8480%" y="117" width="0.0479%" height="15" fill="rgb(230,49,44)" fg:x="177" fg:w="10"/><text x="1.0980%" y="127.50"></text></g><g><title>elf_dynamic_do_Rela (10 samples, 0.05%)</title><rect x="0.8480%" y="101" width="0.0479%" height="15" fill="rgb(229,67,23)" fg:x="177" fg:w="10"/><text x="1.0980%" y="111.50"></text></g><g><title>[libGLX_mesa.so.0.0.0] (34 samples, 0.16%)</title><rect x="0.7426%" y="373" width="0.1629%" height="15" fill="rgb(249,83,47)" fg:x="155" fg:w="34"/><text x="0.9926%" y="383.50"></text></g><g><title>[libGLX_mesa.so.0.0.0] (34 samples, 0.16%)</title><rect x="0.7426%" y="357" width="0.1629%" height="15" fill="rgb(215,43,3)" fg:x="155" fg:w="34"/><text x="0.9926%" y="367.50"></text></g><g><title>[libGLX_mesa.so.0.0.0] (34 samples, 0.16%)</title><rect x="0.7426%" y="341" width="0.1629%" height="15" fill="rgb(238,154,13)" fg:x="155" fg:w="34"/><text x="0.9926%" y="351.50"></text></g><g><title>shooter3d::create_canvas (56 samples, 0.27%)</title><rect x="0.6420%" y="469" width="0.2683%" height="15" fill="rgb(219,56,2)" fg:x="134" fg:w="56"/><text x="0.8920%" y="479.50"></text></g><g><title>sdl2::video::WindowBuilder::build (38 samples, 0.18%)</title><rect x="0.7282%" y="453" width="0.1821%" height="15" fill="rgb(233,0,4)" fg:x="152" fg:w="38"/><text x="0.9782%" y="463.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (38 samples, 0.18%)</title><rect x="0.7282%" y="437" width="0.1821%" height="15" fill="rgb(235,30,7)" fg:x="152" fg:w="38"/><text x="0.9782%" y="447.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (38 samples, 0.18%)</title><rect x="0.7282%" y="421" width="0.1821%" height="15" fill="rgb(250,79,13)" fg:x="152" fg:w="38"/><text x="0.9782%" y="431.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (38 samples, 0.18%)</title><rect x="0.7282%" y="405" width="0.1821%" height="15" fill="rgb(211,146,34)" fg:x="152" fg:w="38"/><text x="0.9782%" y="415.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (35 samples, 0.17%)</title><rect x="0.7426%" y="389" width="0.1677%" height="15" fill="rgb(228,22,38)" fg:x="155" fg:w="35"/><text x="0.9926%" y="399.50"></text></g><g><title>shooter3d::main (5 samples, 0.02%)</title><rect x="0.9103%" y="469" width="0.0240%" height="15" fill="rgb(235,168,5)" fg:x="190" fg:w="5"/><text x="1.1603%" y="479.50"></text></g><g><title>core::iter::range::&lt;impl core::iter::traits::iterator::Iterator for core::ops::range::Range&lt;A&gt;&gt;::next (3 samples, 0.01%)</title><rect x="0.9342%" y="453" width="0.0144%" height="15" fill="rgb(221,155,16)" fg:x="195" fg:w="3"/><text x="1.1842%" y="463.50"></text></g><g><title>&lt;core::ops::range::Range&lt;T&gt; as core::iter::range::RangeIteratorImpl&gt;::spec_next (3 samples, 0.01%)</title><rect x="0.9342%" y="437" width="0.0144%" height="15" fill="rgb(215,215,53)" fg:x="195" fg:w="3"/><text x="1.1842%" y="447.50"></text></g><g><title>core::cmp::impls::&lt;impl core::cmp::PartialOrd for u32&gt;::lt (3 samples, 0.01%)</title><rect x="0.9342%" y="421" width="0.0144%" height="15" fill="rgb(223,4,10)" fg:x="195" fg:w="3"/><text x="1.1842%" y="431.50"></text></g><g><title>&lt;T as core::convert::Into&lt;U&gt;&gt;::into (4 samples, 0.02%)</title><rect x="0.9582%" y="437" width="0.0192%" height="15" fill="rgb(234,103,6)" fg:x="200" fg:w="4"/><text x="1.2082%" y="447.50"></text></g><g><title>&lt;sdl2::rect::Point as core::convert::From&lt;(i32,i32)&gt;&gt;::from (4 samples, 0.02%)</title><rect x="0.9582%" y="421" width="0.0192%" height="15" fill="rgb(227,97,0)" fg:x="200" fg:w="4"/><text x="1.2082%" y="431.50"></text></g><g><title>sdl2::rect::Point::new (4 samples, 0.02%)</title><rect x="0.9582%" y="405" width="0.0192%" height="15" fill="rgb(234,150,53)" fg:x="200" fg:w="4"/><text x="1.2082%" y="415.50"></text></g><g><title>sdl2::rect::clamp_position (4 samples, 0.02%)</title><rect x="0.9582%" y="389" width="0.0192%" height="15" fill="rgb(228,201,54)" fg:x="200" fg:w="4"/><text x="1.2082%" y="399.50"></text></g><g><title>sdl2::render::Canvas&lt;T&gt;::draw_point (97 samples, 0.46%)</title><rect x="0.9486%" y="453" width="0.4647%" height="15" fill="rgb(222,22,37)" fg:x="198" fg:w="97"/><text x="1.1986%" y="463.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (91 samples, 0.44%)</title><rect x="0.9773%" y="437" width="0.4360%" height="15" fill="rgb(237,53,32)" fg:x="204" fg:w="91"/><text x="1.2273%" y="447.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (72 samples, 0.34%)</title><rect x="1.0684%" y="421" width="0.3449%" height="15" fill="rgb(233,25,53)" fg:x="223" fg:w="72"/><text x="1.3184%" y="431.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (38 samples, 0.18%)</title><rect x="1.2313%" y="405" width="0.1821%" height="15" fill="rgb(210,40,34)" fg:x="257" fg:w="38"/><text x="1.4813%" y="415.50"></text></g><g><title>__calloc (13 samples, 0.06%)</title><rect x="1.3510%" y="389" width="0.0623%" height="15" fill="rgb(241,220,44)" fg:x="282" fg:w="13"/><text x="1.6010%" y="399.50"></text></g><g><title>_int_malloc (7 samples, 0.03%)</title><rect x="1.3798%" y="373" width="0.0335%" height="15" fill="rgb(235,28,35)" fg:x="288" fg:w="7"/><text x="1.6298%" y="383.50"></text></g><g><title>[iris_dri.so] (4 samples, 0.02%)</title><rect x="1.6768%" y="357" width="0.0192%" height="15" fill="rgb(210,56,17)" fg:x="350" fg:w="4"/><text x="1.9268%" y="367.50"></text></g><g><title>sdl2::render::Canvas&lt;T&gt;::present (62 samples, 0.30%)</title><rect x="1.4133%" y="453" width="0.2970%" height="15" fill="rgb(224,130,29)" fg:x="295" fg:w="62"/><text x="1.6633%" y="463.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (62 samples, 0.30%)</title><rect x="1.4133%" y="437" width="0.2970%" height="15" fill="rgb(235,212,8)" fg:x="295" fg:w="62"/><text x="1.6633%" y="447.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (62 samples, 0.30%)</title><rect x="1.4133%" y="421" width="0.2970%" height="15" fill="rgb(223,33,50)" fg:x="295" fg:w="62"/><text x="1.6633%" y="431.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (60 samples, 0.29%)</title><rect x="1.4229%" y="405" width="0.2875%" height="15" fill="rgb(219,149,13)" fg:x="297" fg:w="60"/><text x="1.6729%" y="415.50"></text></g><g><title>[iris_dri.so] (9 samples, 0.04%)</title><rect x="1.6672%" y="389" width="0.0431%" height="15" fill="rgb(250,156,29)" fg:x="348" fg:w="9"/><text x="1.9172%" y="399.50"></text></g><g><title>[iris_dri.so] (9 samples, 0.04%)</title><rect x="1.6672%" y="373" width="0.0431%" height="15" fill="rgb(216,193,19)" fg:x="348" fg:w="9"/><text x="1.9172%" y="383.50"></text></g><g><title>__memcpy_avx_unaligned_erms (3 samples, 0.01%)</title><rect x="1.6960%" y="357" width="0.0144%" height="15" fill="rgb(216,135,14)" fg:x="354" fg:w="3"/><text x="1.9460%" y="367.50"></text></g><g><title>sdl2::render::Canvas&lt;T&gt;::set_draw_color (18 samples, 0.09%)</title><rect x="1.7103%" y="453" width="0.0862%" height="15" fill="rgb(241,47,5)" fg:x="357" fg:w="18"/><text x="1.9603%" y="463.50"></text></g><g><title>[libSDL2-2.0.so.0.2600.3] (10 samples, 0.05%)</title><rect x="1.7487%" y="437" width="0.0479%" height="15" fill="rgb(233,42,35)" fg:x="365" fg:w="10"/><text x="1.9987%" y="447.50"></text></g><g><title>&lt;core::slice::iter::Iter&lt;T&gt; as core::iter::traits::iterator::Iterator&gt;::next (163 samples, 0.78%)</title><rect x="25.1569%" y="437" width="0.7809%" height="15" fill="rgb(231,13,6)" fg:x="5251" fg:w="163"/><text x="25.4069%" y="447.50"></text></g><g><title>&lt;f32 as core::ops::arith::Add&gt;::add (3,424 samples, 16.40%)</title><rect x="25.9378%" y="405" width="16.4040%" height="15" fill="rgb(207,181,40)" fg:x="5414" fg:w="3424"/><text x="26.1878%" y="415.50">&lt;f32 as core::ops::arith:..</text></g><g><title>nalgebra::base::blas::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::dot (5,799 samples, 27.78%)</title><rect x="25.9378%" y="437" width="27.7823%" height="15" fill="rgb(254,173,49)" fg:x="5414" fg:w="5799"/><text x="26.1878%" y="447.50">nalgebra::base::blas::&lt;impl nalgebra::base::m..</text></g><g><title>nalgebra::base::blas::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::dotx (5,799 samples, 27.78%)</title><rect x="25.9378%" y="421" width="27.7823%" height="15" fill="rgb(221,1,38)" fg:x="5414" fg:w="5799"/><text x="26.1878%" y="431.50">nalgebra::base::blas::&lt;impl nalgebra::base::m..</text></g><g><title>&lt;f32 as core::ops::arith::Mul&gt;::mul (2,375 samples, 11.38%)</title><rect x="42.3418%" y="405" width="11.3783%" height="15" fill="rgb(206,124,46)" fg:x="8838" fg:w="2375"/><text x="42.5918%" y="415.50">&lt;f32 as core::ops..</text></g><g><title>&lt;f32 as core::ops::arith::Mul&gt;::mul (1,382 samples, 6.62%)</title><rect x="59.3159%" y="421" width="6.6210%" height="15" fill="rgb(249,21,11)" fg:x="12381" fg:w="1382"/><text x="59.5659%" y="431.50">&lt;f32 as c..</text></g><g><title>nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;::cross (2,725 samples, 13.06%)</title><rect x="53.7201%" y="437" width="13.0551%" height="15" fill="rgb(222,201,40)" fg:x="11213" fg:w="2725"/><text x="53.9701%" y="447.50">nalgebra::base::matr..</text></g><g><title>&lt;f32 as core::ops::arith::Sub&gt;::sub (175 samples, 0.84%)</title><rect x="65.9369%" y="421" width="0.8384%" height="15" fill="rgb(235,61,29)" fg:x="13763" fg:w="175"/><text x="66.1869%" y="431.50"></text></g><g><title>&lt;T as simba::simd::simd_complex::SimdComplexField&gt;::simd_sqrt (509 samples, 2.44%)</title><rect x="66.7753%" y="421" width="2.4386%" height="15" fill="rgb(219,207,3)" fg:x="13938" fg:w="509"/><text x="67.0253%" y="431.50">&lt;T..</text></g><g><title>&lt;f32 as simba::scalar::complex::ComplexField&gt;::sqrt (509 samples, 2.44%)</title><rect x="66.7753%" y="405" width="2.4386%" height="15" fill="rgb(222,56,46)" fg:x="13938" fg:w="509"/><text x="67.0253%" y="415.50">&lt;f..</text></g><g><title>std::f32::&lt;impl f32&gt;::sqrt (509 samples, 2.44%)</title><rect x="66.7753%" y="389" width="2.4386%" height="15" fill="rgb(239,76,54)" fg:x="13938" fg:w="509"/><text x="67.0253%" y="399.50">st..</text></g><g><title>&lt;f32 as core::ops::arith::Add&gt;::add (302 samples, 1.45%)</title><rect x="69.2186%" y="373" width="1.4468%" height="15" fill="rgb(231,124,27)" fg:x="14448" fg:w="302"/><text x="69.4686%" y="383.50"></text></g><g><title>nalgebra::base::norm::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::norm (844 samples, 4.04%)</title><rect x="66.7753%" y="437" width="4.0435%" height="15" fill="rgb(249,195,6)" fg:x="13938" fg:w="844"/><text x="67.0253%" y="447.50">nalg..</text></g><g><title>nalgebra::base::norm::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::norm_squared (335 samples, 1.60%)</title><rect x="69.2138%" y="421" width="1.6049%" height="15" fill="rgb(237,174,47)" fg:x="14447" fg:w="335"/><text x="69.4638%" y="431.50"></text></g><g><title>nalgebra::base::blas::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::dotc (334 samples, 1.60%)</title><rect x="69.2186%" y="405" width="1.6002%" height="15" fill="rgb(206,201,31)" fg:x="14448" fg:w="334"/><text x="69.4686%" y="415.50"></text></g><g><title>nalgebra::base::blas::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::dotx (334 samples, 1.60%)</title><rect x="69.2186%" y="389" width="1.6002%" height="15" fill="rgb(231,57,52)" fg:x="14448" fg:w="334"/><text x="69.4686%" y="399.50"></text></g><g><title>&lt;f32 as core::ops::arith::Mul&gt;::mul (32 samples, 0.15%)</title><rect x="70.6655%" y="373" width="0.1533%" height="15" fill="rgb(248,177,22)" fg:x="14750" fg:w="32"/><text x="70.9155%" y="383.50"></text></g><g><title>nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;::unscale (619 samples, 2.97%)</title><rect x="70.8188%" y="421" width="2.9656%" height="15" fill="rgb(215,211,37)" fg:x="14782" fg:w="619"/><text x="71.0688%" y="431.50">nal..</text></g><g><title>nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;::map (619 samples, 2.97%)</title><rect x="70.8188%" y="405" width="2.9656%" height="15" fill="rgb(241,128,51)" fg:x="14782" fg:w="619"/><text x="71.0688%" y="415.50">nal..</text></g><g><title>nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;::unscale::{{closure}} (619 samples, 2.97%)</title><rect x="70.8188%" y="389" width="2.9656%" height="15" fill="rgb(227,165,31)" fg:x="14782" fg:w="619"/><text x="71.0688%" y="399.50">nal..</text></g><g><title>&lt;T as simba::simd::simd_complex::SimdComplexField&gt;::simd_unscale (619 samples, 2.97%)</title><rect x="70.8188%" y="373" width="2.9656%" height="15" fill="rgb(228,167,24)" fg:x="14782" fg:w="619"/><text x="71.0688%" y="383.50">&lt;T ..</text></g><g><title>&lt;f32 as simba::scalar::complex::ComplexField&gt;::unscale (619 samples, 2.97%)</title><rect x="70.8188%" y="357" width="2.9656%" height="15" fill="rgb(228,143,12)" fg:x="14782" fg:w="619"/><text x="71.0688%" y="367.50">&lt;f3..</text></g><g><title>&lt;T as simba::simd::simd_complex::SimdComplexField&gt;::simd_sqrt (445 samples, 2.13%)</title><rect x="73.7843%" y="405" width="2.1319%" height="15" fill="rgb(249,149,8)" fg:x="15401" fg:w="445"/><text x="74.0343%" y="415.50">&lt;..</text></g><g><title>&lt;f32 as simba::scalar::complex::ComplexField&gt;::sqrt (445 samples, 2.13%)</title><rect x="73.7843%" y="389" width="2.1319%" height="15" fill="rgb(243,35,44)" fg:x="15401" fg:w="445"/><text x="74.0343%" y="399.50">&lt;..</text></g><g><title>std::f32::&lt;impl f32&gt;::sqrt (445 samples, 2.13%)</title><rect x="73.7843%" y="373" width="2.1319%" height="15" fill="rgb(246,89,9)" fg:x="15401" fg:w="445"/><text x="74.0343%" y="383.50">s..</text></g><g><title>&lt;f32 as core::ops::arith::AddAssign&gt;::add_assign (5 samples, 0.02%)</title><rect x="75.9163%" y="389" width="0.0240%" height="15" fill="rgb(233,213,13)" fg:x="15846" fg:w="5"/><text x="76.1663%" y="399.50"></text></g><g><title>&lt;f32 as core::ops::arith::Add&gt;::add (597 samples, 2.86%)</title><rect x="75.9402%" y="357" width="2.8602%" height="15" fill="rgb(233,141,41)" fg:x="15851" fg:w="597"/><text x="76.1902%" y="367.50">&lt;f..</text></g><g><title>&lt;f32 as core::ops::arith::Mul&gt;::mul (581 samples, 2.78%)</title><rect x="78.8004%" y="357" width="2.7835%" height="15" fill="rgb(239,167,4)" fg:x="16448" fg:w="581"/><text x="79.0504%" y="367.50">&lt;f..</text></g><g><title>nalgebra::base::norm::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::normalize (2,398 samples, 11.49%)</title><rect x="70.8188%" y="437" width="11.4885%" height="15" fill="rgb(209,217,16)" fg:x="14782" fg:w="2398"/><text x="71.0688%" y="447.50">nalgebra::base::n..</text></g><g><title>nalgebra::base::norm::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::norm (1,779 samples, 8.52%)</title><rect x="73.7843%" y="421" width="8.5230%" height="15" fill="rgb(219,88,35)" fg:x="15401" fg:w="1779"/><text x="74.0343%" y="431.50">nalgebra::ba..</text></g><g><title>nalgebra::base::norm::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::norm_squared (1,334 samples, 6.39%)</title><rect x="75.9163%" y="405" width="6.3910%" height="15" fill="rgb(220,193,23)" fg:x="15846" fg:w="1334"/><text x="76.1663%" y="415.50">nalgebra..</text></g><g><title>nalgebra::base::blas::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::dotc (1,329 samples, 6.37%)</title><rect x="75.9402%" y="389" width="6.3671%" height="15" fill="rgb(230,90,52)" fg:x="15851" fg:w="1329"/><text x="76.1902%" y="399.50">nalgebra..</text></g><g><title>nalgebra::base::blas::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::dotx (1,329 samples, 6.37%)</title><rect x="75.9402%" y="373" width="6.3671%" height="15" fill="rgb(252,106,19)" fg:x="15851" fg:w="1329"/><text x="76.1902%" y="383.50">nalgebra..</text></g><g><title>shooter3d::main (151 samples, 0.72%)</title><rect x="81.5839%" y="357" width="0.7234%" height="15" fill="rgb(206,74,20)" fg:x="17029" fg:w="151"/><text x="81.8339%" y="367.50"></text></g><g><title>nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;::unscale_mut (25 samples, 0.12%)</title><rect x="82.3073%" y="421" width="0.1198%" height="15" fill="rgb(230,138,44)" fg:x="17180" fg:w="25"/><text x="82.5573%" y="431.50"></text></g><g><title>nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;::apply (25 samples, 0.12%)</title><rect x="82.3073%" y="405" width="0.1198%" height="15" fill="rgb(235,182,43)" fg:x="17180" fg:w="25"/><text x="82.5573%" y="415.50"></text></g><g><title>nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;::unscale_mut::{{closure}} (25 samples, 0.12%)</title><rect x="82.3073%" y="389" width="0.1198%" height="15" fill="rgb(242,16,51)" fg:x="17180" fg:w="25"/><text x="82.5573%" y="399.50"></text></g><g><title>&lt;T as simba::simd::simd_complex::SimdComplexField&gt;::simd_unscale (25 samples, 0.12%)</title><rect x="82.3073%" y="373" width="0.1198%" height="15" fill="rgb(248,9,4)" fg:x="17180" fg:w="25"/><text x="82.5573%" y="383.50"></text></g><g><title>&lt;f32 as simba::scalar::complex::ComplexField&gt;::unscale (25 samples, 0.12%)</title><rect x="82.3073%" y="357" width="0.1198%" height="15" fill="rgb(210,31,22)" fg:x="17180" fg:w="25"/><text x="82.5573%" y="367.50"></text></g><g><title>&lt;T as simba::simd::simd_complex::SimdComplexField&gt;::simd_sqrt (27 samples, 0.13%)</title><rect x="82.4271%" y="405" width="0.1294%" height="15" fill="rgb(239,54,39)" fg:x="17205" fg:w="27"/><text x="82.6771%" y="415.50"></text></g><g><title>&lt;f32 as simba::scalar::complex::ComplexField&gt;::sqrt (27 samples, 0.13%)</title><rect x="82.4271%" y="389" width="0.1294%" height="15" fill="rgb(230,99,41)" fg:x="17205" fg:w="27"/><text x="82.6771%" y="399.50"></text></g><g><title>std::f32::&lt;impl f32&gt;::sqrt (27 samples, 0.13%)</title><rect x="82.4271%" y="373" width="0.1294%" height="15" fill="rgb(253,106,12)" fg:x="17205" fg:w="27"/><text x="82.6771%" y="383.50"></text></g><g><title>&lt;f32 as core::ops::arith::AddAssign&gt;::add_assign (8 samples, 0.04%)</title><rect x="82.5564%" y="389" width="0.0383%" height="15" fill="rgb(213,46,41)" fg:x="17232" fg:w="8"/><text x="82.8064%" y="399.50"></text></g><g><title>&lt;f32 as core::ops::arith::Add&gt;::add (18 samples, 0.09%)</title><rect x="82.5947%" y="357" width="0.0862%" height="15" fill="rgb(215,133,35)" fg:x="17240" fg:w="18"/><text x="82.8447%" y="367.50"></text></g><g><title>nalgebra::base::norm::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::normalize_mut (85 samples, 0.41%)</title><rect x="82.3073%" y="437" width="0.4072%" height="15" fill="rgb(213,28,5)" fg:x="17180" fg:w="85"/><text x="82.5573%" y="447.50"></text></g><g><title>nalgebra::base::norm::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::norm (60 samples, 0.29%)</title><rect x="82.4271%" y="421" width="0.2875%" height="15" fill="rgb(215,77,49)" fg:x="17205" fg:w="60"/><text x="82.6771%" y="431.50"></text></g><g><title>nalgebra::base::norm::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::norm_squared (33 samples, 0.16%)</title><rect x="82.5564%" y="405" width="0.1581%" height="15" fill="rgb(248,100,22)" fg:x="17232" fg:w="33"/><text x="82.8064%" y="415.50"></text></g><g><title>nalgebra::base::blas::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::dotc (25 samples, 0.12%)</title><rect x="82.5947%" y="389" width="0.1198%" height="15" fill="rgb(208,67,9)" fg:x="17240" fg:w="25"/><text x="82.8447%" y="399.50"></text></g><g><title>nalgebra::base::blas::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R,C,S&gt;&gt;::dotx (25 samples, 0.12%)</title><rect x="82.5947%" y="373" width="0.1198%" height="15" fill="rgb(219,133,21)" fg:x="17240" fg:w="25"/><text x="82.8447%" y="383.50"></text></g><g><title>&lt;f32 as core::ops::arith::Mul&gt;::mul (7 samples, 0.03%)</title><rect x="82.6810%" y="357" width="0.0335%" height="15" fill="rgb(246,46,29)" fg:x="17258" fg:w="7"/><text x="82.9310%" y="367.50"></text></g><g><title>nalgebra::base::ops::&lt;impl core::ops::arith::Add&lt;nalgebra::base::matrix::Matrix&lt;T,R2,C2,SB&gt;&gt; for nalgebra::base::matrix::Matrix&lt;T,R1,C1,SA&gt;&gt;::add (1,398 samples, 6.70%)</title><rect x="82.7145%" y="437" width="6.6976%" height="15" fill="rgb(246,185,52)" fg:x="17265" fg:w="1398"/><text x="82.9645%" y="447.50">nalgebra:..</text></g><g><title>nalgebra::base::ops::&lt;impl core::ops::arith::Add&lt;&amp;nalgebra::base::matrix::Matrix&lt;T,R2,C2,SB&gt;&gt; for nalgebra::base::matrix::Matrix&lt;T,R1,C1,SA&gt;&gt;::add (1,398 samples, 6.70%)</title><rect x="82.7145%" y="421" width="6.6976%" height="15" fill="rgb(252,136,11)" fg:x="17265" fg:w="1398"/><text x="82.9645%" y="431.50">nalgebra:..</text></g><g><title>nalgebra::base::ops::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R1,C1,SA&gt;&gt;::add_assign_statically_unchecked (1,398 samples, 6.70%)</title><rect x="82.7145%" y="405" width="6.6976%" height="15" fill="rgb(219,138,53)" fg:x="17265" fg:w="1398"/><text x="82.9645%" y="415.50">nalgebra:..</text></g><g><title>&lt;f32 as core::ops::arith::AddAssign&gt;::add_assign (1,398 samples, 6.70%)</title><rect x="82.7145%" y="389" width="6.6976%" height="15" fill="rgb(211,51,23)" fg:x="17265" fg:w="1398"/><text x="82.9645%" y="399.50">&lt;f32 as c..</text></g><g><title>nalgebra::base::ops::&lt;impl core::ops::arith::Mul&lt;nalgebra::base::matrix::Matrix&lt;f32,R,C,S&gt;&gt; for f32&gt;::mul (678 samples, 3.25%)</title><rect x="89.4122%" y="437" width="3.2482%" height="15" fill="rgb(247,221,28)" fg:x="18663" fg:w="678"/><text x="89.6622%" y="447.50">nal..</text></g><g><title>nalgebra::base::ops::&lt;impl core::ops::arith::Sub&lt;nalgebra::base::matrix::Matrix&lt;T,R2,C2,SB&gt;&gt; for nalgebra::base::matrix::Matrix&lt;T,R1,C1,SA&gt;&gt;::sub (1,246 samples, 5.97%)</title><rect x="92.6604%" y="437" width="5.9694%" height="15" fill="rgb(251,222,45)" fg:x="19341" fg:w="1246"/><text x="92.9104%" y="447.50">nalgebra..</text></g><g><title>nalgebra::base::ops::&lt;impl core::ops::arith::Sub&lt;&amp;nalgebra::base::matrix::Matrix&lt;T,R2,C2,SB&gt;&gt; for nalgebra::base::matrix::Matrix&lt;T,R1,C1,SA&gt;&gt;::sub (1,246 samples, 5.97%)</title><rect x="92.6604%" y="421" width="5.9694%" height="15" fill="rgb(217,162,53)" fg:x="19341" fg:w="1246"/><text x="92.9104%" y="431.50">nalgebra..</text></g><g><title>nalgebra::base::ops::&lt;impl nalgebra::base::matrix::Matrix&lt;T,R1,C1,SA&gt;&gt;::sub_assign_statically_unchecked (1,246 samples, 5.97%)</title><rect x="92.6604%" y="405" width="5.9694%" height="15" fill="rgb(229,93,14)" fg:x="19341" fg:w="1246"/><text x="92.9104%" y="415.50">nalgebra..</text></g><g><title>&lt;f32 as core::ops::arith::SubAssign&gt;::sub_assign (1,246 samples, 5.97%)</title><rect x="92.6604%" y="389" width="5.9694%" height="15" fill="rgb(209,67,49)" fg:x="19341" fg:w="1246"/><text x="92.9104%" y="399.50">&lt;f32 as ..</text></g><g><title>shooter3d::calculate_pixel_color (20,214 samples, 96.84%)</title><rect x="1.7966%" y="453" width="96.8428%" height="15" fill="rgb(213,87,29)" fg:x="375" fg:w="20214"/><text x="2.0466%" y="463.50">shooter3d::calculate_pixel_color</text></g><g><title>__libc_start_main_alias_2 (20,759 samples, 99.45%)</title><rect x="0.5366%" y="725" width="99.4538%" height="15" fill="rgb(205,151,52)" fg:x="112" fg:w="20759"/><text x="0.7866%" y="735.50">__libc_start_main_alias_2</text></g><g><title>__libc_start_call_main (20,759 samples, 99.45%)</title><rect x="0.5366%" y="709" width="99.4538%" height="15" fill="rgb(253,215,39)" fg:x="112" fg:w="20759"/><text x="0.7866%" y="719.50">__libc_start_call_main</text></g><g><title>main (20,758 samples, 99.45%)</title><rect x="0.5414%" y="693" width="99.4490%" height="15" fill="rgb(221,220,41)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="703.50">main</text></g><g><title>std::rt::lang_start_internal (20,758 samples, 99.45%)</title><rect x="0.5414%" y="677" width="99.4490%" height="15" fill="rgb(218,133,21)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="687.50">std::rt::lang_start_internal</text></g><g><title>std::panic::catch_unwind (20,758 samples, 99.45%)</title><rect x="0.5414%" y="661" width="99.4490%" height="15" fill="rgb(221,193,43)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="671.50">std::panic::catch_unwind</text></g><g><title>std::panicking::try (20,758 samples, 99.45%)</title><rect x="0.5414%" y="645" width="99.4490%" height="15" fill="rgb(240,128,52)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="655.50">std::panicking::try</text></g><g><title>std::panicking::try::do_call (20,758 samples, 99.45%)</title><rect x="0.5414%" y="629" width="99.4490%" height="15" fill="rgb(253,114,12)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="639.50">std::panicking::try::do_call</text></g><g><title>std::rt::lang_start_internal::{{closure}} (20,758 samples, 99.45%)</title><rect x="0.5414%" y="613" width="99.4490%" height="15" fill="rgb(215,223,47)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="623.50">std::rt::lang_start_internal::{{closure}}</text></g><g><title>std::panic::catch_unwind (20,758 samples, 99.45%)</title><rect x="0.5414%" y="597" width="99.4490%" height="15" fill="rgb(248,225,23)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="607.50">std::panic::catch_unwind</text></g><g><title>std::panicking::try (20,758 samples, 99.45%)</title><rect x="0.5414%" y="581" width="99.4490%" height="15" fill="rgb(250,108,0)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="591.50">std::panicking::try</text></g><g><title>std::panicking::try::do_call (20,758 samples, 99.45%)</title><rect x="0.5414%" y="565" width="99.4490%" height="15" fill="rgb(228,208,7)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="575.50">std::panicking::try::do_call</text></g><g><title>core::ops::function::impls::&lt;impl core::ops::function::FnOnce&lt;A&gt; for &amp;F&gt;::call_once (20,758 samples, 99.45%)</title><rect x="0.5414%" y="549" width="99.4490%" height="15" fill="rgb(244,45,10)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="559.50">core::ops::function::impls::&lt;impl core::ops::function::FnOnce&lt;A&gt; for &amp;F&gt;::call_once</text></g><g><title>std::rt::lang_start::{{closure}} (20,758 samples, 99.45%)</title><rect x="0.5414%" y="533" width="99.4490%" height="15" fill="rgb(207,125,25)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="543.50">std::rt::lang_start::{{closure}}</text></g><g><title>std::sys_common::backtrace::__rust_begin_short_backtrace (20,758 samples, 99.45%)</title><rect x="0.5414%" y="517" width="99.4490%" height="15" fill="rgb(210,195,18)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="527.50">std::sys_common::backtrace::__rust_begin_short_backtrace</text></g><g><title>core::ops::function::FnOnce::call_once (20,758 samples, 99.45%)</title><rect x="0.5414%" y="501" width="99.4490%" height="15" fill="rgb(249,80,12)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="511.50">core::ops::function::FnOnce::call_once</text></g><g><title>shooter3d::main (20,758 samples, 99.45%)</title><rect x="0.5414%" y="485" width="99.4490%" height="15" fill="rgb(221,65,9)" fg:x="113" fg:w="20758"/><text x="0.7914%" y="495.50">shooter3d::main</text></g><g><title>shooter3d::render (20,676 samples, 99.06%)</title><rect x="0.9342%" y="469" width="99.0562%" height="15" fill="rgb(235,49,36)" fg:x="195" fg:w="20676"/><text x="1.1842%" y="479.50">shooter3d::render</text></g><g><title>shooter3d::main (282 samples, 1.35%)</title><rect x="98.6394%" y="453" width="1.3510%" height="15" fill="rgb(225,32,20)" fg:x="20589" fg:w="282"/><text x="98.8894%" y="463.50"></text></g><g><title>all (20,873 samples, 100%)</title><rect x="0.0000%" y="773" width="100.0000%" height="15" fill="rgb(215,141,46)" fg:x="0" fg:w="20873"/><text x="0.2500%" y="783.50"></text></g><g><title>shooter3d (20,818 samples, 99.74%)</title><rect x="0.2635%" y="757" width="99.7365%" height="15" fill="rgb(250,160,47)" fg:x="55" fg:w="20818"/><text x="0.5135%" y="767.50">shooter3d</text></g><g><title>_start (20,766 samples, 99.49%)</title><rect x="0.5126%" y="741" width="99.4874%" height="15" fill="rgb(216,222,40)" fg:x="107" fg:w="20766"/><text x="0.7626%" y="751.50">_start</text></g></svg></svg>
