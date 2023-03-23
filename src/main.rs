@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use nalgebra::{UnitVector3, Vector3};
+use nalgebra::Vector2;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::Color;
@@ -21,20 +21,19 @@ enum Material {
 }
 use Material::*;
 
-static W: u32 = 600;
-static H: u32 = 600;
+static W: u32 = 800;
+static H: u32 = 800;
 
 struct Camera {
-    pos: Vector3<f32>,
-    normal: Vector3<f32>,
+    pos: Vector2<f32>,
+    normal: Vector2<f32>,
     width: u32,
     height: u32,
 }
 
 struct Wall {
-    pos: Vector3<f32>,
-    s1: Vector3<f32>,
-    s2: Vector3<f32>,
+    pos: Vector2<f32>,
+    side: Vector2<f32>,
     color: Color,
 }
 
@@ -59,53 +58,70 @@ fn read_map(file: &Path) -> Vec<Vec<Material>> {
     rows
 }
 
-fn calculate_pixel_color(x: u32, y: u32, cam: &Camera, walls: &[Wall]) -> Result<Color, String> {
-    let y = cam.height - y;
+// fn sample_map() -> Vec<Vec<Material>> {
+//     vec![
+//         vec![Empty, Empty, Empty],
+//         vec![Empty, G, Empty],
+//         vec![Empty, Empty, Empty],
+//     ]
+// }
 
-    // TODO: Normlize with respect to X only
+fn cross(v: &Vector2<f32>, w: &Vector2<f32>) -> f32 {
+    v.x * w.y - v.y * w.x
+}
+
+fn calculate_vline(x: u32, cam: &Camera, walls: &[Wall]) -> Result<Vec<Color>, String> {
     let x = (x as f32 / cam.width as f32) - 0.5;
-    let y = (y as f32 / cam.height as f32) - 0.5;
+    let center_pixel = cam.pos + cam.normal * 1.0;
+    let camera_x_unit = Vector2::new(-cam.normal.y, cam.normal.x);
+    let vline_pos = center_pixel + x * camera_x_unit;
 
-    let center_pixel = cam.pos + cam.normal * 1.0; // TODO: 1.0 is focal_length
-    let pixel_pos =
-        center_pixel + y * Vector3::z() + x * (cam.normal.cross(&Vector3::z())).normalize();
+    let ray_dir = (vline_pos - cam.pos).normalize();
 
-    let mut ray_dir = pixel_pos - cam.pos;
-    ray_dir.normalize_mut();
-
-    let mut closest_color = None;
+    let mut vline = vec![Color::WHITE; H as usize];
     let mut closest_distance = f32::INFINITY;
 
+    for i in 0..cam.height {
+        let y = cam.height - i;
+        let y = (y as f32 / cam.height as f32) - 0.5;
+
+        if y < 0.0 {
+            vline[i as usize] = Color::BLACK;
+        } else {
+            vline[i as usize] = Color::WHITE;
+        }
+    }
+
     for wall in walls {
-        let plane_normal = wall.s1.cross(&wall.s2).normalize();
-        let angle = ray_dir.dot(&plane_normal);
+        let a = cross(&(cam.pos - wall.pos), &ray_dir) / cross(&wall.side, &ray_dir);
 
-        if angle < 0.0 {
-            let a = (wall.pos - cam.pos).dot(&plane_normal) / angle;
-            let p = cam.pos + a * ray_dir;
+        if a > 0.0 && a < 1.0 {
+            let t = cross(&(wall.pos - cam.pos), &wall.side) / cross(&ray_dir, &wall.side);
+            let instersection_point = cam.pos + ray_dir * t;
+            let distance = (instersection_point - cam.pos).dot(&cam.normal);
+            if t < 0.0 || distance > closest_distance {
+                continue;
+            }
+            closest_distance = distance;
 
-            let diff = p - wall.pos;
+            let wall_height = 1.0 / distance;
 
-            let q1 = diff.dot(&wall.s1) / wall.s1.norm();
-            let q2 = diff.dot(&wall.s2) / wall.s2.norm();
+            for i in 0..cam.height {
+                let y = cam.height - i;
+                let y = (y as f32 / cam.height as f32) - 0.5;
 
-            if q1 > 0.0 && q1 < wall.s1.norm() && q2 > 0.0 && q2 < wall.s2.norm() && a > 0.0 {
-                let distance = (p - pixel_pos).norm();
-                if distance < closest_distance {
-                    closest_color = Some(wall.color);
-                    closest_distance = distance;
+                if y < -(wall_height / 2.0) {
+                    vline[i as usize] = Color::BLACK;
+                } else if y > -(wall_height / 2.0) && y < wall_height / 2.0 {
+                    vline[i as usize] = wall.color;
+                } else {
+                    vline[i as usize] = Color::WHITE;
                 }
             }
         }
     }
 
-    if let Some(color) = closest_color {
-        Ok(color)
-    } else if ray_dir.z < 0.0 {
-        Ok(Color::RGB(70, 50, 40))
-    } else {
-        Ok(Color::RGB(170, 170, 230))
-    }
+    Ok(vline)
 }
 
 fn create_walls(map: &Vec<Vec<Material>>) -> Vec<Wall> {
@@ -119,29 +135,25 @@ fn create_walls(map: &Vec<Vec<Material>>) -> Vec<Wall> {
                 Empty => None,
             };
             if let Some(color) = color {
-                let center = Vector3::new(x as f32 * 1.0, y as f32 * 1.0, 1.0);
+                let center = Vector2::new(x as f32 * 1.0, y as f32 * 1.0);
                 walls.push(Wall {
-                    pos: center + Vector3::new(-0.5, -0.5, -0.5),
-                    s1: Vector3::new(1.0, 0.0, 0.0),
-                    s2: Vector3::new(0.0, 0.0, 1.0),
+                    pos: center + Vector2::new(-0.5, -0.5),
+                    side: Vector2::new(1.0, 0.0),
                     color,
                 });
                 walls.push(Wall {
-                    pos: center + Vector3::new(0.5, -0.5, -0.5),
-                    s1: Vector3::new(0.0, 1.0, 0.0),
-                    s2: Vector3::new(0.0, 0.0, 1.0),
+                    pos: center + Vector2::new(0.5, -0.5),
+                    side: Vector2::new(0.0, 1.0),
                     color,
                 });
                 walls.push(Wall {
-                    pos: center + Vector3::new(0.5, 0.5, -0.5),
-                    s1: Vector3::new(-1.0, 0.0, 0.0),
-                    s2: Vector3::new(0.0, 0.0, 1.0),
+                    pos: center + Vector2::new(0.5, 0.5),
+                    side: Vector2::new(-1.0, 0.0),
                     color,
                 });
                 walls.push(Wall {
-                    pos: center + Vector3::new(-0.5, 0.5, -0.5),
-                    s1: Vector3::new(0.0, -1.0, 0.0),
-                    s2: Vector3::new(0.0, 0.0, 1.0),
+                    pos: center + Vector2::new(-0.5, 0.5),
+                    side: Vector2::new(0.0, -1.0),
                     color,
                 });
             }
@@ -167,13 +179,13 @@ fn render(canvas: &mut Canvas<Window>, camera: &Camera, walls: &Vec<Wall>) -> Re
     canvas.set_draw_color(Color::RGB(255, 0, 0));
     canvas.clear();
 
-    for y in 0..H {
-        for x in 0..W {
-            canvas.set_draw_color(calculate_pixel_color(x, y, &camera, &walls)?);
+    for x in 0..W {
+        let vline: Vec<Color> = calculate_vline(x, &camera, &walls)?;
+        for y in 0..H {
+            canvas.set_draw_color(vline[y as usize]);
             canvas.draw_point((x as i32, y as i32))?;
         }
     }
-
     canvas.present();
     Ok(())
 }
@@ -188,19 +200,18 @@ pub fn main() -> Result<(), String> {
 
     let mut event_pump = sdl_context.event_pump()?;
     let mut camera = Camera {
-        pos: Vector3::new(0.0, -1.0, 1.0),
-        normal: Vector3::new(0.0, 1.0, 0.0),
+        pos: Vector2::new(1.5, 1.5),
+        normal: Vector2::new(0.0, 1.0),
         height: H,
         width: W,
     };
 
     let map = read_map(Path::new("map.map"));
+    // let map = sample_map();
     let walls = create_walls(&map);
 
-    let left_rotation =
-        nalgebra::UnitQuaternion::from_axis_angle(&UnitVector3::new_normalize(Vector3::z()), 0.1);
-    let right_rotation =
-        nalgebra::UnitQuaternion::from_axis_angle(&UnitVector3::new_normalize(Vector3::z()), -0.1);
+    let left_rotation = nalgebra::UnitComplex::from_angle(-0.1);
+    let right_rotation = nalgebra::UnitComplex::from_angle(0.1);
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -210,22 +221,24 @@ pub fn main() -> Result<(), String> {
                     keycode: Some(Keycode::Escape),
                     ..
                 } => break 'running,
-                Event::KeyDown {
-                    keycode: Some(keycode),
-                    ..
-                } => match keycode {
-                    Keycode::Up => camera.pos += camera.normal * 0.2,
-                    Keycode::Down => camera.pos -= camera.normal * 0.2,
-                    Keycode::Left => camera.normal = left_rotation * camera.normal,
-                    Keycode::Right => camera.normal = right_rotation * camera.normal,
-                    _ => {}
-                },
                 _ => {}
             }
         }
+
+        if event_pump.keyboard_state().is_scancode_pressed(sdl2::keyboard::Scancode::Left) {
+            camera.normal = left_rotation * camera.normal; 
+        }
+        if event_pump.keyboard_state().is_scancode_pressed(sdl2::keyboard::Scancode::Right) {
+            camera.normal = right_rotation * camera.normal; 
+        }
+        if event_pump.keyboard_state().is_scancode_pressed(sdl2::keyboard::Scancode::Up) {
+            camera.pos += camera.normal * 0.2; 
+        }
+        if event_pump.keyboard_state().is_scancode_pressed(sdl2::keyboard::Scancode::Down) {
+            camera.pos -= camera.normal * 0.2; 
+        }
+
         render(&mut canvas, &camera, &walls)?;
-        // ::std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 30));
-        // The rest of the game loop goes here...
     }
 
     Ok(())
