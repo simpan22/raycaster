@@ -1,5 +1,7 @@
 # Raycasting demo
 Very rough implementation of the raycasting algorithm for rendering 3d-looking scenes fast based on a 2d map.
+## Screenshot
+<img src="images/screenshot.png" width=400/>
 
 ## Theory
 The speed increase compared to 1-iteration raytracing comes from the fact that the intersection calculations are only calculated in 2d.
